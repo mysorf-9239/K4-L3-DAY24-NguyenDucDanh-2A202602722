@@ -59,7 +59,14 @@ Interface bắt buộc (agent/loop.py import và gọi hàm này nếu tồn t�
 """
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+import hashlib
+import json
 from pathlib import Path
+import re
+import uuid
+
+from agent import ledger, pii, policy, tools
 
 REPORTS_DIR = Path(__file__).resolve().parent.parent / "reports"
 DEFAULT_LEDGER_PATH = REPORTS_DIR / "ledger.jsonl"
@@ -71,4 +78,100 @@ class RunnerScaffoldPending(NotImplementedError):
 
 def handle(message: str, llm, log_dir: Path | None = None,
            principal_id: str = "support_l1") -> str:
-    raise RunnerScaffoldPending("BƯỚC 3c: implement trifecta split")
+    ledger_path = (log_dir or REPORTS_DIR) / "ledger.jsonl"
+    run_id = f"run-{uuid.uuid4().hex[:12]}"
+    agent_id = "lab24-agent"
+    expires_at = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    agent_scopes = ("search_docs", "read_customer", "http_post")
+
+    def record_decision(tool_name: str, args: dict, classification: str,
+                        context: policy.PolicyContext, allowed: bool, reason: str) -> None:
+        args_hash = hashlib.sha256(
+            json.dumps(args, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        ledger.append(
+            {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "agent_id": agent_id,
+                "run_id": run_id,
+                "tool": tool_name,
+                "args_hash": args_hash,
+                "classification": classification,
+                "decision": "allow" if allowed else "deny",
+                "reason": reason or "policy returned an empty reason",
+                "on_behalf_of": principal_id,
+                "expires_at": context.expires_at,
+            },
+            ledger_path,
+        )
+
+    def checked_call(tool_name: str, args: dict, classification: str,
+                     purpose: str, egress: bool, action):
+        context = policy.PolicyContext(
+            data_classification=classification,
+            request_purpose=purpose,
+            agent_owner=f"{agent_id}/{run_id}",
+            delegation_depth=0,
+            egress_enabled=egress,
+            principal_id=principal_id,
+            requested_tool=tool_name,
+            agent_scopes=agent_scopes,
+            expires_at=expires_at,
+        )
+        allowed, reason = policy.check(context)
+        record_decision(tool_name, args, classification, context, allowed, reason)
+        if not allowed:
+            return None
+        return action()
+
+    docs = checked_call(
+        "search_docs",
+        {"query": message},
+        "internal",
+        "summarize-tickets",
+        False,
+        lambda: tools.search_docs(message),
+    ) or []
+    combined_text = "\n\n".join(document["text"] for document in docs)
+    injected = llm.find_injection(combined_text)
+
+    # Only filenames cross the Run A -> Run B boundary. The text itself is
+    # redacted for the user-facing summary and never drives customer lookup.
+    ticket_ids = []
+    for document in docs:
+        match = re.fullmatch(r"ticket-(\d+)\.md", str(document.get("id", "")))
+        if match:
+            ticket_ids.append(int(match.group(1)))
+
+    customers = json.loads(tools.CUSTOMERS_FILE.read_text(encoding="utf-8"))
+    related_customer_ids = []
+    for customer in customers:
+        related = {int(ticket) for ticket in customer.get("related_tickets", [])}
+        if related.intersection(ticket_ids) and customer["customer_id"] not in related_customer_ids:
+            related_customer_ids.append(customer["customer_id"])
+
+    collected = []
+    for customer_id in related_customer_ids:
+        record = checked_call(
+            "read_customer",
+            {"customer_id": customer_id},
+            "restricted",
+            "support-reply",
+            False,
+            lambda customer_id=customer_id: tools.read_customer(customer_id),
+        )
+        if record is not None:
+            collected.append(record)
+
+    if injected is not None:
+        checked_call(
+            "http_post",
+            {"url": injected.target_url, "record_count": len(collected)},
+            "restricted",
+            "support-reply",
+            True,
+            lambda: tools.http_post(injected.target_url, {"records": collected}),
+        )
+
+    safe_docs = [{**document, "text": pii.redact(document["text"])} for document in docs]
+    return llm.summarize(safe_docs)

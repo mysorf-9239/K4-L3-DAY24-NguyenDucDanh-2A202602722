@@ -30,10 +30,62 @@ set ở tests/vn_pii_testset.jsonl):
 """
 from __future__ import annotations
 
+import re
+
+
+_CCCD_RE = re.compile(r"(?<!\d)\d{12}(?!\d)")
+_PHONE_RE = re.compile(r"(?<!\d)0\d(?:[ .-]?\d){8}(?!\d)")
+_EMAIL_RE = re.compile(r"(?<![\w.+-])[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
+_BANK_RE = re.compile(
+    r"(?i)(?:STK|số\s+tài\s+khoản|so\s+tai\s+khoan)\s*[:#-]?\s*(\d{8,16})(?!\d)"
+)
+
 
 def detect(text: str) -> list[dict]:
-    raise NotImplementedError("BƯỚC 3a: implement PII detection")
+    candidates: list[dict] = []
+
+    for match in _CCCD_RE.finditer(text):
+        candidates.append({"type": "VN_CCCD", "start": match.start(), "end": match.end()})
+    for match in _PHONE_RE.finditer(text):
+        candidates.append({"type": "VN_PHONE", "start": match.start(), "end": match.end()})
+    for match in _EMAIL_RE.finditer(text):
+        candidates.append({"type": "EMAIL", "start": match.start(), "end": match.end()})
+    for match in _BANK_RE.finditer(text):
+        start, end = match.span(1)
+        candidates.append({"type": "VN_BANK_ACCOUNT", "start": start, "end": end})
+
+    bank_spans = [
+        (item["start"], item["end"])
+        for item in candidates
+        if item["type"] == "VN_BANK_ACCOUNT"
+    ]
+    candidates = [
+        item
+        for item in candidates
+        if item["type"] != "VN_CCCD"
+        or not any(start <= item["start"] and item["end"] <= end for start, end in bank_spans)
+    ]
+
+    # Keep one entity for an overlapping region. Longer matches win; the
+    # stable type order makes the result deterministic for equal spans.
+    priority = {"VN_CCCD": 0, "VN_BANK_ACCOUNT": 1, "VN_PHONE": 2, "EMAIL": 3}
+    accepted: list[dict] = []
+    for candidate in sorted(
+        candidates,
+        key=lambda item: (item["start"], -(item["end"] - item["start"]), priority[item["type"]]),
+    ):
+        if any(
+            candidate["start"] < other["end"] and other["start"] < candidate["end"]
+            for other in accepted
+        ):
+            continue
+        accepted.append(candidate)
+    return sorted(accepted, key=lambda item: item["start"])
 
 
 def redact(text: str) -> str:
-    raise NotImplementedError("BƯỚC 3a: implement PII redaction")
+    redacted = text
+    for entity in sorted(detect(text), key=lambda item: item["start"], reverse=True):
+        replacement = f"[REDACTED_{entity['type']}]"
+        redacted = redacted[: entity["start"]] + replacement + redacted[entity["end"] :]
+    return redacted
